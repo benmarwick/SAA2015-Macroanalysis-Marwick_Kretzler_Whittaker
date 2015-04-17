@@ -1,0 +1,382 @@
+---
+title: "Textual Macroanalysis of the Grand Challenges of Archaeology
+"
+output: html_document
+---
+
+
+```{r get_data}
+# convert PDF to text
+# windows: see https://gist.github.com/benmarwick/11333467
+# system("sudo apt-get update && sudo apt-get install poppler-utils -y")
+# report <- "data/GrandChallengeCrowdSourcingReport.pdf"
+# system(paste('"pdftotext"', report, '"data/out.txt"'), wait = FALSE )
+# wait 5 secs...
+report <- scan('data/out.txt', what = character())
+```
+
+```{r identify_responses}
+# Some manual inspection of the full text is required here to validate that
+# we're going to sample only the text of the responses, not the introduction, etc.
+
+# open the text for inspection
+# View(report)
+
+# What lines do we see the word 'Reponses'? This will narrow down the 
+# places to inspect for the start of the responses
+lines_containing_word_Reponses <- grep("Responses", report) 
+# Looks like 350 is the correct start of the response text
+
+# The responses section is followed by a section on 'Respondent Demographics'
+# What line does that next section start on? This will tell us the end 
+# of the responses section
+lines_containing_word_Demographics <- grep("Demographics", report) 
+# Responses end on line 3268
+```
+
+```{r extract_responses}
+# Let's subset the report to extact only the response text
+# get responses only
+responses <- report[350:3268]
+
+# join into one big vector
+responses <- paste(responses, collapse = " ")
+
+# get only text between 'challenge' and 'justification
+# ie. exclude justifications because the focus of this 
+# analysis are the challenges.
+individual_responses <- unlist(regmatches(responses, gregexpr("(?<=Challenge).*?(?=Justification)", responses, perl=TRUE)))
+
+
+# remove anything that's not a letter (ie. punctuation, numbers)
+individual_responses <- sapply(individual_responses,function(i) gsub('[^[:alpha:]]',' ', i))
+
+
+                               
+```
+
+
+```{r}
+# Treat each response as a document
+library("tm")
+# make corpus
+corpus <- tm::Corpus(VectorSource(individual_responses))
+# make term document matrix
+tdm1 <- tm::TermDocumentMatrix(corpus, 
+                          control = list(removePunctuation = TRUE, 
+                                         stopwords = TRUE,
+                                         removePunctuation = TRUE,
+                                         removeNumbers = TRUE,
+                                         stripWhitespace = TRUE,
+                                         tolower = TRUE, 
+                                         wordLengths=c(3,10)))
+
+# keep only words that occur >n times in all docs
+rowTotals <-  slam::row_sums(tdm1)
+tdm_n <- tdm1[which(rowTotals > 3), ]
+
+
+# investigate the distribution of lengths
+hist(apply(tdm_n, 2, sum), xlab="Number of words per response",
+main="", breaks=100)
+```
+ 
+ 
+ 
+
+
+```{r top_words}
+
+# join into one big vector (again)
+responses <- paste(responses, collapse = " ")
+
+# remove anything that's not a letter (ie. punctuation, numbers)
+responses <- gsub('[^[:alpha:]]',' ', responses)
+
+# split into words
+responses <-  unlist(strsplit(responses, " "))
+
+# remove empty items
+responses <- responses[responses != ""]
+
+# remove words with one or two letters which might be typos or 
+# abbreviations
+responses <- responses[!nchar(responses) < 3 ]
+
+# remove a few generic stopwords and lower case
+responses <- tolower(responses[!(responses %in% tm::stopwords(kind = "en"))])
+
+
+```
+ 
+ 
+ 
+ 
+
+```{r pre_processing}
+# remove some stopwords specific to this context (eg. "archaeology", 
+# "grand",  "challenge", etc.)
+custom_stopwords <- scan('data/custom_stopwords.txt', what = character())
+
+# Treat each response as a document
+# make corpus
+corpus <- tm::Corpus(tm::VectorSource(individual_responses))
+corpus <- tm_map(corpus, removeWords, custom_stopwords)
+# make term document matrix
+tdm <- tm::TermDocumentMatrix(corpus, 
+                          control = list(removePunctuation = TRUE, 
+                                         stopwords = TRUE,
+                                         removePunctuation = TRUE,
+                                         removeNumbers = TRUE,
+                                         stripWhitespace = TRUE,
+                                         tolower = TRUE, 
+                                         wordLengths=c(3,10)))
+
+# isolate terms to remove non-nouns
+terms <- tdm$dimnames$Terms
+ 
+# remove punctation and spaces (again, just to be sure)
+terms <- gsub('[[:punct:]]','', terms)
+terms <- gsub('\\\\','', terms)
+ 
+
+# this is a function to identify the part-of-speech of each word
+# We'll use this to filter out everything except nouns
+tagPOS <-  function(x) {
+  
+  s <- NLP::as.String(x)
+  ## Need sentence and word token annotations.
+  
+  a1 <- NLP::Annotation(1L, "sentence", 1L, nchar(s))
+  a2 <- NLP::annotate(s, openNLP::Maxent_Word_Token_Annotator(), a1)
+  a3 <- NLP::annotate(s,  openNLP::Maxent_POS_Tag_Annotator(), a2)
+  
+  ## Determine the distribution of POS tags for word tokens.
+  a3w <- a3[a3$type == "word"]
+  POStags <- unlist(lapply(a3w$features, `[[`, "POS"))
+  
+  ## Extract token/POS pairs (all of them): easy - not needed
+  # POStagged <- paste(sprintf("%s/%s", s[a3w], POStags), collapse = " ")
+  return(unlist(POStags))
+}
+ 
+ 
+# divide Terms into chunks of n terms each because more than that can cause
+# memory problems
+terms_split <- split(terms, ceiling(seq_along(terms)/1500))
+ 
+# loop over each chunk of 1000 terms to do POStagging, I found that trying to
+# do 10,000 terms or more causes Java memory problems, so this is a very safe
+# method to try not to fill memory
+terms_split_chunks <- plyr::llply(terms_split, function(i){
+  tmp <- paste(gsub("[^[:alnum:]]", " ", i), collapse = " ")
+  tmp <- tagPOS(tmp)
+  tmp <- tmp[!tmp %in% c(",", "``", "''", ".")]
+}, .progress = "text")
+ 
+ 
+# get all the tags in a vector
+terms_split_chunks_out <- unname(c(unlist(terms_split_chunks)))
+ 
+# subset document term matrix terms to keep only nouns
+tdm_nouns <- tdm[  c(tdm$dimnames$Terms[terms_split_chunks_out == "NN"]), ]
+ 
+# What are the most frequent words?
+(freq_words <- tm::findFreqTerms(tdm_nouns, 7))
+ 
+# What words are associated with those high freq words?
+assocs <- lapply(freq_words, function(i) tm::findAssocs(tdm_nouns, i, 0.3))
+names(assocs) <- freq_words
+assocs
+
+```
+
+
+
+
+
+```{r sparse_k_means_tdm}
+# compute kmeans with n clusters
+
+m <- as.matrix(tdm_n)
+rownames(m) <- 1:nrow(m)
+
+# normalize the vectors so Euclidean makes sense
+norm_eucl <- function(m) m/apply(m, MARGIN=1, FUN=function(x) sum(x^2)^.5)
+m_norm <- norm_eucl(m)
+
+# cluster into n clusters
+n <- 15
+km.perm <- sparcl::KMeansSparseCluster.permute(m, K=n,wbounds=seq(3,10), nperms=10)
+km.out  <- sparcl::KMeansSparseCluster(m, K=n, wbounds=km.perm$bestw)
+
+# create data frame with scores
+scores <- as.data.frame(prcomp(m_norm)$x)
+
+# plot of observations
+library("ggplot2")
+ggplot(data = scores, aes(x = PC1, y = PC2, 
+                          label = rownames(scores),
+                          group = km.out[[1]]$Cs)) +
+  geom_hline(yintercept = 0, colour = "gray65") +
+  geom_vline(xintercept = 0, colour = "gray65") +
+  geom_text(colour = km.out[[1]]$Cs, size = 4) +
+  stat_ellipse(type = "norm", linetype = 1, alpha = 0.2) +
+  theme_minimal()
+
+
+# label clusters with top 20 words
+for (i in 1:max(km.out[[1]]$Cs)) {
+  #For each cluster, this defines the documents in that cluster
+  inGroup <- which(km.out[[1]]$Cs==i)
+  within <- t(tdm_n)[,inGroup]
+  if(length(inGroup)==1) within <- t(as.matrix(within))
+  out <- t(tdm_n)[,-inGroup]
+  words <- apply(within,2,mean) - apply(out,2,mean) #Take the difference in means for each term
+  print(c("Cluster", i), quote=F)
+  labels <- order(words, decreasing=T)[1:20] #Take the top 20 Labels
+  print(names(words)[labels], quote=F) #From here down just labels
+  if(i==max(km.out[[1]]$Cs)) {
+    print("Cluster Membership")
+    #print(table(cl$cluster))
+    print("Within cluster sum of squares by cluster")
+    #print(cl$withinss)
+}
+}
+```
+
+
+
+```{r data_prep_for_classification_test_knn}
+# The report includes the author's classification of each response
+# we can train a classifier based on the manual tagging in the report 
+# and test its accuracy in a hold-out set 
+
+# Let's subset the report to extact only the response text
+# get responses only
+responses <- report[350:3268]
+
+# let's look at the 'scientific questions'
+
+# join into one big vector
+responses <- paste(responses, collapse = " ")
+
+# get only text between 'Q' and 'justification
+# ie. exclude justifications because the focus of this 
+# analysis are the challenges.
+
+sci_questions <- unlist(strsplit(responses, split = "(?=\\[Q)",  perl=TRUE))
+
+# drop just the "[" items in the vector
+sci_questions <- sci_questions[!(sci_questions == "[")]
+
+# only keep items that have 'challange' response
+sci_questions <- sci_questions[grepl("Challenge", sci_questions)]
+
+# extract the challenge response text
+sci_questions_challenge <- unlist(regmatches(sci_questions, gregexpr("(?<=Challenge:).*?(?=Justification)", sci_questions, perl=TRUE)))
+
+# replace all punctuation with spaces to improve TDM
+sci_questions_challenge <- gsub('[[:punct:]]',' ', sci_questions_challenge)
+
+# extract manual classification from each sci_question
+sci_questions_label <- unlist(regmatches(sci_questions, gregexpr("(?=Q).*?(?=])", sci_questions, perl=TRUE)))
+
+# how many labels?
+number_labels <- length(unique(sci_questions_label))
+
+
+# make corpus and tdm
+corpus <- tm::Corpus(tm::VectorSource(sci_questions_challenge))
+# make  document term matrix
+dtm <- tm::DocumentTermMatrix(corpus, 
+                          control = list(removePunctuation = TRUE, 
+                                         stopwords = TRUE,
+                                         removePunctuation = TRUE,
+                                         removeNumbers = TRUE,
+                                         stripWhitespace = TRUE,
+                                         tolower = TRUE, 
+                                         wordLengths=c(3,10)))
+# for convienence, convert to data frame
+dtm_df <- data.frame(as.matrix(dtm))
+
+
+# add labels to data frame
+dtm_df$sci_questions_label <- as.factor(sci_questions_label)
+```
+
+
+
+```{r knn_using_caret}
+# model testing using caret, cf http://www.jstatsoft.org/v28/i05/paper
+# and http://topepo.github.io/caret/training.html
+set.seed(1)
+library("caret")
+
+# identify and remove near-zero variance predictors
+nzv <- nearZeroVar(dtm_df, saveMetrics= TRUE)
+nzv[nzv$nzv,][1:10,]
+dim(nzv)
+
+nzv <- nearZeroVar(dtm_df)
+filteredDescr <- dtm_df
+dim(filteredDescr)
+
+
+# create training set with stratified random splits by labels 
+inTrain <- caret::createDataPartition(sci_questions_label, p = 0.75, list = FALSE)
+trainDescr <- filteredDescr[inTrain,]
+testDescr <- filteredDescr[-inTrain,]
+trainClass <- sci_questions_label[inTrain]
+testClass <- sci_questions_label[-inTrain]
+
+# inspect output, should be quite similar 
+prop.table(table(sci_questions_label))
+
+prop.table(table(trainClass))
+
+#  tune and build the knn model 
+fitControl <- caret::trainControl(## 10-fold CV
+                           method = "repeatedcv",
+                           number = 10,
+                           ## repeated ten times
+                           repeats = 10)
+set.seed(2)
+# remove non-numeric label column
+trainDescr_num <- trainDescr[,-ncol(trainDescr)]
+knnFit <- caret::train(trainDescr_num, as.factor(trainClass),
+  method = "knn",
+  trControl = fitControl, 
+  tuneLength = 50)
+
+# explore output
+knnFit
+ggplot(knnFit) + theme_minimal(base_size = 12)
+resampleHist(knnFit)
+
+# do prediction
+knnPredict <- predict(knnFit, newdata = trainDescr_num )
+# Explore output 
+testDescr_num <- testDescr[,-ncol(testDescr)]
+predValues <- extractPrediction(list(knn=knnFit), testX = testDescr_num, testY = testClass)
+testValues <- subset(predValues, dataType == "Test")
+probValues <- extractProb(list(knn=knnFit), testX = testDescr_num, testY = testClass)
+testProbs <- subset(probValues, dataType == "Test")
+
+# Overall Statistics
+cm <- confusionMatrix(testValues$pred, testValues$obs)
+cm$byClass_df <- data.frame(cm$byClass)
+cm$byClass_df$class <- gsub("Class:", "", row.names(cm$byClass_df))
+cm$byClass_df_m <- reshape2::melt(cm$byClass_df)
+ggplot(cm$byClass_df_m, aes(variable, value, fill = class)) +
+         geom_bar(stat = "identity") +
+         facet_grid(class ~ .) +
+        theme_minimal()
+
+
+```
+
+
+
+
+
